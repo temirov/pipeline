@@ -1,0 +1,680 @@
+Outputting file contents for '.' (excluding specified patterns)...
+File: ./integration_test.go
+package pipeline
+
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+// TestContext is a simple context type for our test pipelines.
+type TestContext struct {
+	Value string
+}
+
+// HelloWorld outputs a single message: "Hello, World!".
+// As a source, it ignores its input.
+type HelloWorld struct {
+	sourceName string
+}
+
+// NewHelloWorldSource creates a new HelloWorldSource.
+func NewHelloWorldSource() *HelloWorld {
+	return &HelloWorld{sourceName: "HelloWorldSource"}
+}
+
+// Name returns the name of the source step.
+func (helloWorldSource *HelloWorld) Name() string {
+	return helloWorldSource.sourceName
+}
+
+func (helloWorldSource *HelloWorld) Hi() string {
+	return "Hi, World!"
+}
+
+// Process implements the Step interface for a source step.
+// It sends a single "Hello, World!" message to the provided output channel.
+func (helloWorldSource *HelloWorld) Process(
+	executionContext context.Context,
+	_ <-chan StepResult[any],
+	outputChannel chan<- StepResult[string],
+	pipelineContext TestContext,
+) error {
+	// result := StepResult[string]{Item: helloWorldSource.Hi()}
+	result := ToStepResult(helloWorldSource.Hi())
+	select {
+	case <-executionContext.Done():
+		return executionContext.Err()
+	case outputChannel <- result:
+		return nil
+	}
+}
+
+// TestSingleStepHelloWorld verifies that a pipeline with a single source step executes without error.
+func TestSingleStepHelloWorld(testInstance *testing.T) {
+	// Create a context with timeout for the pipeline execution.
+	executionContext, cancelFunction := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancelFunction()
+
+	// Create the HelloWorld source step.
+	helloWorldSource := NewHelloWorldSource()
+
+	// Build a pipeline starting with the HelloWorld source.
+	builderInstance := NewPipelineBuilder(helloWorldSource)
+	pipelineInstance := builderInstance.Build()
+
+	// Define a test pipeline context.
+	pipelineExecutionContext := TestContext{Value: "test"}
+
+	// Execute the pipeline.
+	executionError := pipelineInstance.Execute(executionContext, pipelineExecutionContext)
+	if executionError != nil {
+		testInstance.Fatalf("Failed to execute pipeline: %v", executionError)
+	}
+
+	testInstance.Log("Pipeline executed successfully with Hello World source")
+}
+End of file: ./integration_test.go
+----------------------------------------
+File: ./go.mod
+module github.com/temirov/pipeline
+
+go 1.21
+End of file: ./go.mod
+----------------------------------------
+File: ./examples/ls/steps/parse_arguments.go
+package steps
+
+import (
+	"context"
+	"os"
+
+	"github.com/temirov/pipeline"
+)
+
+// LsContext holds the shared context for the ls pipeline.
+type LsContext struct {
+	Wildcard string
+}
+
+// ParseArgumentsStep reads command-line arguments and sets the wildcard in the context.
+type ParseArgumentsStep struct{}
+
+func NewParseArgumentsStep() *ParseArgumentsStep {
+	return &ParseArgumentsStep{}
+}
+
+func (step *ParseArgumentsStep) Name() string {
+	return "ParseArguments"
+}
+
+func (step *ParseArgumentsStep) Process(
+	executionContext context.Context,
+	_ <-chan pipeline.StepResult[any],
+	outputChannel chan<- pipeline.StepResult[string],
+	pipelineContext *LsContext,
+) error {
+	// If a command-line argument is provided, use it as a wildcard; otherwise, list all files.
+	if len(os.Args) > 1 {
+		pipelineContext.Wildcard = os.Args[1]
+	} else {
+		pipelineContext.Wildcard = "*" // default: match all
+	}
+	result := pipeline.ToStepResult("arguments parsed")
+	select {
+	case <-executionContext.Done():
+		return executionContext.Err()
+	case outputChannel <- result:
+		return nil
+	}
+}
+End of file: ./examples/ls/steps/parse_arguments.go
+----------------------------------------
+File: ./examples/ls/steps/list_files.go
+package steps
+
+import (
+	"context"
+	"os"
+
+	"github.com/temirov/pipeline"
+)
+
+// ListFilesStep reads the current directory and outputs each file entry.
+type ListFilesStep struct{}
+
+func NewListFilesStep() *ListFilesStep {
+	return &ListFilesStep{}
+}
+
+func (step *ListFilesStep) Name() string {
+	return "ListFiles"
+}
+
+func (step *ListFilesStep) Process(
+	executionContext context.Context,
+	inputChannel <-chan pipeline.StepResult[string],
+	outputChannel chan<- pipeline.StepResult[os.DirEntry],
+	pipelineContext *LsContext,
+) error {
+	// Consume the dummy input from the previous step.
+	<-inputChannel
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		result := pipeline.ToStepResult(entry)
+		select {
+		case <-executionContext.Done():
+			return executionContext.Err()
+		case outputChannel <- result:
+			// continue
+		}
+	}
+	return nil
+}
+End of file: ./examples/ls/steps/list_files.go
+----------------------------------------
+File: ./examples/ls/steps/filter_files.go
+package steps
+
+import (
+	"context"
+	"path/filepath"
+
+	"github.com/temirov/pipeline"
+	"os"
+)
+
+// FilterFilesStep filters files based on the wildcard pattern in the context.
+type FilterFilesStep struct{}
+
+func NewFilterFilesStep() *FilterFilesStep {
+	return &FilterFilesStep{}
+}
+
+func (step *FilterFilesStep) Name() string {
+	return "FilterFiles"
+}
+
+func (step *FilterFilesStep) Process(
+	executionContext context.Context,
+	inputChannel <-chan pipeline.StepResult[os.DirEntry],
+	outputChannel chan<- pipeline.StepResult[os.DirEntry],
+	pipelineContext *LsContext,
+) error {
+	pattern := pipelineContext.Wildcard
+	for fileResult := range inputChannel {
+		fileEntry := fileResult.Item
+		// If a non-trivial pattern is provided, filter based on it.
+		if pattern != "" && pattern != "*" {
+			matches, err := filepath.Match(pattern, fileEntry.Name())
+			if err != nil || !matches {
+				continue
+			}
+		}
+		result := pipeline.ToStepResult(fileEntry)
+		select {
+		case <-executionContext.Done():
+			return executionContext.Err()
+		case outputChannel <- result:
+			// continue
+		}
+	}
+	return nil
+}
+End of file: ./examples/ls/steps/filter_files.go
+----------------------------------------
+File: ./examples/ls/steps/print_files.go
+package steps
+
+import (
+	"context"
+	"fmt"
+
+	"os"
+
+	"github.com/temirov/pipeline"
+)
+
+// PrintFilesStep prints each file's name to stdout.
+type PrintFilesStep struct{}
+
+func NewPrintFilesStep() *PrintFilesStep {
+	return &PrintFilesStep{}
+}
+
+func (step *PrintFilesStep) Name() string {
+	return "PrintFiles"
+}
+
+func (step *PrintFilesStep) Process(
+	executionContext context.Context,
+	inputChannel <-chan pipeline.StepResult[os.DirEntry],
+	outputChannel chan<- pipeline.StepResult[string],
+	pipelineContext *LsContext,
+) error {
+	for fileResult := range inputChannel {
+		fileEntry := fileResult.Item
+		// Print file name (you can extend to output more info if desired).
+		fmt.Println(fileEntry.Name())
+		result := pipeline.ToStepResult(fileEntry.Name())
+		select {
+		case <-executionContext.Done():
+			return executionContext.Err()
+		case outputChannel <- result:
+			// continue
+		}
+	}
+	return nil
+}
+End of file: ./examples/ls/steps/print_files.go
+----------------------------------------
+File: ./examples/ls/main.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/temirov/pipeline"
+	"github.com/temirov/pipeline/examples/ls/steps"
+)
+
+func main() {
+	// Create the pipeline context.
+	lsContext := &steps.LsContext{}
+
+	// Create an execution context with a timeout.
+	executionContext, cancelFunction := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFunction()
+
+	// Instantiate steps.
+	parseArgsStep := steps.NewParseArgumentsStep() // Source step: Step[any, string, *LsContext]
+	listFilesStep := steps.NewListFilesStep()      // Step[string, os.DirEntry, *LsContext]
+	filterFilesStep := steps.NewFilterFilesStep()  // Step[os.DirEntry, os.DirEntry, *LsContext]
+	printFilesStep := steps.NewPrintFilesStep()    // Step[os.DirEntry, string, *LsContext]
+
+	// Build the pipeline.
+	builderStep := pipeline.NewPipelineBuilder(parseArgsStep)
+	builderList := pipeline.AppendStep(builderStep, listFilesStep)     // output: os.DirEntry
+	builderFilter := pipeline.AppendStep(builderList, filterFilesStep) // output: os.DirEntry
+	builderPrint := pipeline.AppendStep(builderFilter, printFilesStep) // output: string
+	pipelineInstance := builderPrint.Build()
+
+	// Execute the pipeline.
+	if err := pipelineInstance.Execute(executionContext, lsContext); err != nil {
+		fmt.Fprintf(os.Stderr, "Pipeline execution error: %v\n", err)
+		os.Exit(1)
+	}
+}
+End of file: ./examples/ls/main.go
+----------------------------------------
+File: ./README.md
+# Pipeline
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/temirov/pipeline.svg)](https://pkg.go.dev/github.com/temirov/pipeline)
+[![Go Report Card](https://goreportcard.com/badge/github.com/temirov/pipeline)](https://goreportcard.com/report/github.com/temirov/pipeline)
+
+A flexible, composable, and type-safe data processing pipeline framework for Go.
+
+## Features
+
+- **Type Safety**: Uses Go generics to ensure type safety across the pipeline
+- **Composable**: Build pipelines by chaining independent processing steps
+- **Concurrent**: Built-in support for parallel processing
+- **Context-Aware**: Propagates cancellation signals and timeouts through the pipeline
+- **Flexibility**: Process any type of data through the pipeline
+- **Error Handling**: Comprehensive error handling with detailed logging
+
+## Installation
+
+```bash
+go get github.com/temirov/pipeline
+```
+
+## Quick Start
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+
+	"github.com/temirov/pipeline"
+)
+
+// Define your data type
+type Item struct {
+	ID    int
+	Value string
+}
+
+// Define your pipeline context
+type ProcessContext struct {
+	Config map[string]string
+}
+
+// Example source step that generates data
+type SourceStep struct {
+	pipeline.BaseStep[Item, ProcessContext]
+}
+
+func NewSourceStep() *SourceStep {
+	return &SourceStep{
+		BaseStep: pipeline.NewBaseStep[Item, ProcessContext]("Source"),
+	}
+}
+
+func (s *SourceStep) Process(ctx context.Context, output chan<- pipeline.StepResult[Item], pipelineContext ProcessContext) {
+	defer close(output)
+	
+	// Generate some sample data
+	for i := 1; i <= 5; i++ {
+		output <- pipeline.StepResult[Item]{
+			Item: Item{
+				ID:    i,
+				Value: fmt.Sprintf("Item %d", i),
+			},
+		}
+	}
+}
+
+// Example processing step that transforms data
+type ProcessingStep struct {
+	pipeline.BaseStep[Item, ProcessContext]
+}
+
+func NewProcessingStep() *ProcessingStep {
+	return &ProcessingStep{
+		BaseStep: pipeline.NewBaseStep[Item, ProcessContext]("Processor"),
+	}
+}
+
+func (s *ProcessingStep) Process(ctx context.Context, input <-chan Item, output chan<- pipeline.StepResult[Item], pipelineContext ProcessContext) {
+	for item := range input {
+		result := s.ProcessItem(ctx, item, pipelineContext, func(ctx context.Context, item Item, pipelineContext ProcessContext) (bool, error) {
+			// Transform the item
+			item.Value = fmt.Sprintf("%s - Processed", item.Value)
+			return false, nil // Not skipped, no error
+		})
+		output <- result
+	}
+	close(output)
+}
+
+func main() {
+	// Set up logging
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+	
+	// Create pipeline
+	myPipeline := pipeline.NewPipeline[Item, ProcessContext]()
+	
+	// Add steps
+	myPipeline.SetFirstStep(NewSourceStep())
+	myPipeline.AddStep(NewProcessingStep())
+	
+	// Create context
+	ctx := context.Background()
+	pipelineContext := ProcessContext{
+		Config: map[string]string{"key": "value"},
+	}
+	
+	// Execute pipeline
+	if err := myPipeline.Execute(ctx, pipelineContext); err != nil {
+		slog.Error("Pipeline execution failed", "error", err)
+		os.Exit(1)
+	}
+	
+	slog.Info("Pipeline completed successfully")
+}
+```
+
+## Documentation
+
+For detailed documentation and advanced usage examples, please see the [Go package documentation](https://pkg.go.dev/github.com/temirov/pipeline).
+
+## Examples
+
+Check out the [`examples`](examples) directory for more complete usage examples:
+
+- `ls.go`: Implementation of a pipeline that mimics the Unix `ls` command
+- More examples coming soon!
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details. End of file: ./README.md
+----------------------------------------
+File: ./pipeline.go
+package pipeline
+
+import (
+	"context"
+	"fmt"
+)
+
+const defaultBufferSize = 100
+
+// StepResult represents a processed item with a generic type.
+type StepResult[OutputType any] struct {
+	Item       OutputType
+	IsSkipped  bool
+	Error      error
+	ShouldExit bool
+	ExitReason string
+}
+
+// Step is a unified interface for pipeline steps.
+// When the input channel is nil, the step acts as a source.
+type Step[InputType, OutputType, ContextType any] interface {
+	// Process receives an input channel (or nil for sources) and an output channel provided by the pipeline framework.
+	// The step writes its results to outputChannel and returns an error if processing fails.
+	Process(
+		executionContext context.Context,
+		inputChannel <-chan StepResult[InputType],
+		outputChannel chan<- StepResult[OutputType],
+		pipelineContext ContextType,
+	) error
+	Name() string
+}
+
+// PipelineBuilder builds a pipeline while enforcing type consistency between steps.
+// ContextType is the shared context type; CurrentOutputType is the output type of the last step.
+type PipelineBuilder[ContextType, CurrentOutputType any] struct {
+	stepFunctions []func(
+		executionContext context.Context,
+		inputData any,
+		pipelineContext ContextType,
+	) (any, error)
+}
+
+// NewPipelineBuilder creates a new builder starting with a source step.
+// The source step ignores its input (it receives nil).
+func NewPipelineBuilder[ContextType, OutputType any](
+	sourceStep Step[any, OutputType, ContextType],
+) *PipelineBuilder[ContextType, OutputType] {
+	wrappedSourceFunction := func(
+		executionContext context.Context,
+		ignoredInput any,
+		pipelineContext ContextType,
+	) (any, error) {
+		outputChannel := make(chan StepResult[OutputType], defaultBufferSize)
+		go func() {
+			_ = sourceStep.Process(executionContext, nil, outputChannel, pipelineContext)
+			close(outputChannel)
+		}()
+		return outputChannel, nil
+	}
+	return &PipelineBuilder[ContextType, OutputType]{
+		stepFunctions: []func(
+			executionContext context.Context,
+			inputData any,
+			pipelineContext ContextType,
+		) (any, error){wrappedSourceFunction},
+	}
+}
+
+// AppendStep adds a new transformation step to the pipeline.
+// NewOutputType is the output type of the new step.
+func AppendStep[
+	ContextType, CurrentOutputType, NewOutputType any,
+](
+	builder *PipelineBuilder[ContextType, CurrentOutputType],
+	transformationStep Step[CurrentOutputType, NewOutputType, ContextType],
+) *PipelineBuilder[ContextType, NewOutputType] {
+	wrappedTransformationFunction := func(
+		executionContext context.Context,
+		inputData any,
+		pipelineContext ContextType,
+	) (any, error) {
+		typedInputChannel, ok := inputData.(chan StepResult[CurrentOutputType])
+		if !ok {
+			return nil, fmt.Errorf("invalid input type for step %s", transformationStep.Name())
+		}
+		outputChannel := make(chan StepResult[NewOutputType], defaultBufferSize)
+		go func() {
+			_ = transformationStep.Process(executionContext, typedInputChannel, outputChannel, pipelineContext)
+			close(outputChannel)
+		}()
+		return outputChannel, nil
+	}
+	newStepFunctions := make([]func(
+		executionContext context.Context,
+		inputData any,
+		pipelineContext ContextType,
+	) (any, error), len(builder.stepFunctions))
+	copy(newStepFunctions, builder.stepFunctions)
+	newStepFunctions = append(newStepFunctions, wrappedTransformationFunction)
+	return &PipelineBuilder[ContextType, NewOutputType]{stepFunctions: newStepFunctions}
+}
+
+// Pipeline represents an executable pipeline.
+// ContextType is the shared context and FinalOutputType is the final output type.
+type Pipeline[ContextType, FinalOutputType any] struct {
+	stepFunctions []func(
+		executionContext context.Context,
+		inputData any,
+		pipelineContext ContextType,
+	) (any, error)
+}
+
+// Build converts a PipelineBuilder into an executable Pipeline.
+func (builder *PipelineBuilder[ContextType, FinalOutputType]) Build() *Pipeline[ContextType, FinalOutputType] {
+	return &Pipeline[ContextType, FinalOutputType]{stepFunctions: builder.stepFunctions}
+}
+
+// Execute runs all the steps in the pipeline sequentially.
+// It asserts the final output channel as a bidirectional channel and drains it.
+func (pipelineInstance *Pipeline[ContextType, FinalOutputType]) Execute(
+	executionContext context.Context,
+	pipelineContext ContextType,
+) error {
+	var currentOutput any = nil // start with nil input for the source step
+	var functionError error
+
+	for _, stepFunction := range pipelineInstance.stepFunctions {
+		currentOutput, functionError = stepFunction(executionContext, currentOutput, pipelineContext)
+		if functionError != nil {
+			return functionError
+		}
+	}
+
+	// Assert the final output to be a bidirectional channel.
+	finalOutputChannel, ok := currentOutput.(chan StepResult[FinalOutputType])
+	if !ok {
+		return fmt.Errorf("unexpected final output type")
+	}
+
+	// Drain the final output channel.
+	for range finalOutputChannel {
+		// Optionally process final items.
+	}
+	return nil
+}
+
+// ToStepResult wraps a given item into a StepResult.
+// It can be extended to set default flags if needed.
+func ToStepResult[ItemType any](item ItemType) StepResult[ItemType] {
+	return StepResult[ItemType]{Item: item}
+}
+End of file: ./pipeline.go
+----------------------------------------
+File: ./Makefile
+.PHONY: build test lint clean example file-listing
+
+# Build the library
+build:
+	go build -v ./...
+
+# Run tests
+test:
+	go test -v ./...
+
+# Run linter
+lint:
+	golangci-lint run
+
+# Clean build artifacts
+clean:
+	rm -rf bin/
+
+# Run the simple example
+example:
+	go run examples/simple/main.go
+
+# Run the file listing example
+file-listing:
+	go run examples/file_listing/main.go
+
+# Install dependencies
+deps:
+	go get -v ./...
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+# Help command
+help:
+	@echo "Available commands:"
+	@echo "  make build        - Build the library"
+	@echo "  make test         - Run tests"
+	@echo "  make lint         - Run linter"
+	@echo "  make clean        - Clean build artifacts"
+	@echo "  make example      - Run the simple example"
+	@echo "  make file-listing - Run the file listing example"
+	@echo "  make deps         - Install dependencies" End of file: ./Makefile
+----------------------------------------
+File: ./LICENSE
+MIT License
+
+Copyright (c) 2023 Timur Temirov
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE. End of file: ./LICENSE
+----------------------------------------
